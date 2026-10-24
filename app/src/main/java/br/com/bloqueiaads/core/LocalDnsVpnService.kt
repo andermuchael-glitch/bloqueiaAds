@@ -19,13 +19,18 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 /**
- * DNS-only local VPN for the MVP. It does not tunnel general traffic to a remote VPN.
- * Current scope: IPv4/UDP DNS queries only.
+ * Experimental DNS-only local VPN. Not a full traffic tunnel.
+ * Fail-safe principle: do not block a domain unless the query was parsed safely.
  */
 class LocalDnsVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private val running = AtomicBoolean(false)
-    private val upstream by lazy { InetAddress.getByName("1.1.1.1") }
+    private val upstreams by lazy {
+        listOf(
+            InetAddress.getByName("1.1.1.1"),
+            InetAddress.getByName("8.8.8.8")
+        )
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, notification())
@@ -63,7 +68,7 @@ class LocalDnsVpnService : VpnService() {
                     )
                     synchronized(output) { output.write(packet) }
                 } catch (_: Exception) {
-                    if (running.get()) { /* Ignore transient packet errors; loop remains active. */ }
+                    // Do not terminate the worker on a single malformed packet.
                 }
             }
             try { input.close() } catch (_: Exception) {}
@@ -71,21 +76,26 @@ class LocalDnsVpnService : VpnService() {
         }
     }
 
+    /** Try two public resolvers so one unreachable resolver does not break all DNS. */
     private fun forwardDns(query: ByteArray): ByteArray? {
-        val socket = DatagramSocket()
-        return try {
-            if (!protect(socket)) return null
-            socket.soTimeout = 3500
-            socket.send(DatagramPacket(query, query.size, upstream, 53))
-            val data = ByteArray(4096)
-            val packet = DatagramPacket(data, data.size)
-            socket.receive(packet)
-            packet.data.copyOf(packet.length)
-        } catch (_: Exception) {
-            null
-        } finally {
-            socket.close()
+        for (resolver in upstreams) {
+            val socket = DatagramSocket()
+            try {
+                if (!protect(socket)) continue
+                socket.soTimeout = 2500
+                socket.send(DatagramPacket(query, query.size, resolver, 53))
+                val data = ByteArray(4096)
+                val packet = DatagramPacket(data, data.size)
+                socket.receive(packet)
+                if (packet.length >= 12) return packet.data.copyOf(packet.length)
+            } catch (_: Exception) {
+                // Try the next resolver.
+            } finally {
+                socket.close()
+            }
         }
+        // Fail closed for the query only if both upstream DNS resolvers fail.
+        return null
     }
 
     private fun notification(): Notification {
@@ -102,7 +112,7 @@ class LocalDnsVpnService : VpnService() {
         )
         return NotificationCompat.Builder(this, channelId)
             .setContentTitle("Bloqueia Ads ativo")
-            .setContentText("Filtragem DNS local em execução")
+            .setContentText("Filtragem DNS experimental em execução")
             .setSmallIcon(android.R.drawable.ic_secure)
             .setContentIntent(pi)
             .setOngoing(true)
